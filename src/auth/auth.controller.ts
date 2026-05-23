@@ -14,7 +14,6 @@ export class AuthController {
     }
 
     return {
-      userId: req.auth.userId,
       activeRole: req.auth.activeRole,
       allowedRoles: req.auth.allowedRoles,
       permissions: req.auth.permissions,
