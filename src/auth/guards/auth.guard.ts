@@ -7,12 +7,26 @@ import {
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { JwtService } from '@nestjs/jwt';
+import { Request } from 'express';
 
 import {
   PermisoRequerido,
   REQUIRE_PERMISSIONS_KEY,
 } from '../decorators/require-permissions.decorator';
 import { IS_PUBLIC_KEY } from '../decorators/public.decorator';
+import {
+  DatabaseService,
+  ModulePermission,
+  RoleSummary,
+} from '../../database/database.service';
+
+export interface AuthContext {
+  userId: number;
+  activeRole: RoleSummary;
+  allowedRoles: RoleSummary[];
+  permissions: ModulePermission[];
+  tokenPayload: any;
+}
 
 @Injectable()
 export class AuthorizationGuard implements CanActivate {
@@ -35,13 +49,18 @@ export class AuthorizationGuard implements CanActivate {
     '/docs',
   ]);
 
+  private readonly authContextRoutes = new Set([
+    '/auth/context',
+  ]);
+
   constructor(
     private readonly reflector: Reflector,
     private readonly jwtService: JwtService,
+    private readonly dbService: DatabaseService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
-    const request = context.switchToHttp().getRequest();
+    const request = context.switchToHttp().getRequest<Request & { auth?: AuthContext; user?: any }>();
     const requestPath = this.normalizeRequestPath(request.originalUrl ?? request.url);
     const moduleRoute = this.getModuleRouteFromRequest(requestPath);
     const normalizedMethod = String(request.method || '').toUpperCase();
@@ -51,9 +70,7 @@ export class AuthorizationGuard implements CanActivate {
     }
 
     if (!this.allowedHttpMethods.has(normalizedMethod)) {
-      throw new ForbiddenException(
-        `Método HTTP no permitido: ${normalizedMethod}`,
-      );
+      throw new ForbiddenException(`Metodo HTTP no permitido: ${normalizedMethod}`);
     }
 
     if (this.isPublicPath(requestPath)) {
@@ -68,7 +85,7 @@ export class AuthorizationGuard implements CanActivate {
       return true;
     }
 
-    const permission = this.reflector.get<PermisoRequerido>(
+    const requiredPermission = this.reflector.get<PermisoRequerido>(
       REQUIRE_PERMISSIONS_KEY,
       context.getHandler(),
     );
@@ -79,34 +96,47 @@ export class AuthorizationGuard implements CanActivate {
     }
 
     try {
-      const payload = await this.jwtService.verifyAsync(token, {
+      const payload = await this.jwtService.verifyAsync<any>(token, {
         secret: process.env.JWT_SECRET,
       });
 
-      if (!payload?.userId || !Array.isArray(payload?.permissions)) {
+      if (!payload?.userId) {
         throw new UnauthorizedException('Claims insuficientes en token');
       }
 
-      if (!this.canAccess(payload, moduleRoute, normalizedMethod)) {
+      const authContext = await this.buildAuthContext(payload);
+      request.auth = authContext;
+      request.user = authContext.tokenPayload?.user ?? { id: authContext.userId };
+
+      if (this.authContextRoutes.has(requestPath)) {
+        return true;
+      }
+
+      if (!this.canAccess(authContext.permissions, moduleRoute, normalizedMethod)) {
         throw new ForbiddenException(
           `No tienes permiso ${normalizedMethod} sobre ${moduleRoute}`,
         );
       }
 
-      if (permission && !this.hasLegacyPermissionHint(payload, permission)) {
+      if (
+        requiredPermission &&
+        !this.hasLegacyPermissionHint(authContext.permissions, requiredPermission)
+      ) {
         throw new ForbiddenException(
-          `No tienes acceso al módulo ${permission.modulo}`,
+          `No tienes acceso al modulo ${requiredPermission.modulo}`,
         );
       }
 
-      request.user = payload;
       return true;
     } catch (error) {
       if (error instanceof ForbiddenException) {
         throw error;
       }
+      if (error instanceof UnauthorizedException) {
+        throw error;
+      }
 
-      throw new UnauthorizedException('Token inválido o expirado');
+      throw new UnauthorizedException('Token invalido o expirado');
     }
   }
 
@@ -164,10 +194,10 @@ export class AuthorizationGuard implements CanActivate {
     return path === '/docs' || path.startsWith('/docs/');
   }
 
-  private canAccess(decodedToken: any, moduleRoute: string, method: string): boolean {
+  private canAccess(permissions: ModulePermission[], moduleRoute: string, method: string): boolean {
     const normalizedMethod = method.toUpperCase();
 
-    return decodedToken.permissions.some((modulePermission: any) => {
+    return permissions.some((modulePermission: ModulePermission) => {
       if (!modulePermission || typeof modulePermission.route !== 'string') {
         return false;
       }
@@ -193,18 +223,49 @@ export class AuthorizationGuard implements CanActivate {
   }
 
   private hasLegacyPermissionHint(
-    payload: any,
+    permissions: ModulePermission[],
     permission: PermisoRequerido,
   ): boolean {
-    if (!Array.isArray(payload?.permissions)) {
+    if (!Array.isArray(permissions)) {
       return false;
     }
 
-    return payload.permissions.some(
-      (item: any) =>
+    return permissions.some(
+      (item: ModulePermission) =>
         item?.module === permission.modulo ||
         item?.code === permission.modulo ||
         item?.route === permission.modulo,
     );
+  }
+
+  private async buildAuthContext(payload: any): Promise<AuthContext> {
+    const userId = Number(payload.userId);
+    if (!Number.isFinite(userId)) {
+      throw new UnauthorizedException('userId invalido en token');
+    }
+
+    const dbUser = await this.dbService.findActiveUserById(userId);
+    if (!dbUser || !dbUser.isActive) {
+      throw new UnauthorizedException('Usuario no existe o esta inactivo');
+    }
+
+    const allowedRoles = await this.dbService.findUserRoles(userId);
+    if (allowedRoles.length === 0) {
+      throw new ForbiddenException('El usuario no tiene roles asignados');
+    }
+
+    const activeRoleIdFromToken = Number(payload.activeRole?.id ?? payload.activeRoleId);
+    const activeRole =
+      allowedRoles.find((role) => role.id === activeRoleIdFromToken) ?? allowedRoles[0];
+
+    const permissions = await this.dbService.findRolePermissions(activeRole.id);
+
+    return {
+      userId,
+      activeRole,
+      allowedRoles,
+      permissions,
+      tokenPayload: payload,
+    };
   }
 }
